@@ -1,0 +1,38 @@
+{
+  "enabled": {
+    "description": "启用插件",
+    "type": "bool",
+    "default": true,
+    "hint": "开启后，在已触发 LLM 的消息中自动处理图片。"
+  },
+  "caption_provider_id": {
+    "description": "图片转述模型 Provider ID（可留空）",
+    "type": "string",
+    "default": "",
+    "hint": "留空时使用 AstrBot 的“默认图片转述模型”。"
+  },
+  "caption_prompt": {
+    "description": "图片转述提示词",
+    "type": "text",
+    "default": "请识别并简洁描述用户发送的图片，供另一个无法直接看图的聊天模型理解。说明主要人物、物体、场景、动作和重要文字；如果是表情包、梗图或聊天截图，也说明其主要含义和情绪。不要回答用户，只输出图片描述。",
+    "hint": "无需用户主动说“识图”“描述图片”等关键词。"
+  },
+  "remove_images_from_main_model": {
+    "description": "转述成功后移除原图",
+    "type": "bool",
+    "default": true,
+    "hint": "DeepSeek 等纯文本主模型建议保持开启。"
+  },
+  "remove_images_on_failure": {
+    "description": "转述失败时也移除原图",
+    "type": "bool",
+    "default": false,
+    "hint": "通常关闭；若主模型完全不能接收图片且会因此报错，可开启。"
+  },
+  "debug_log": {
+    "description": "调试日志",
+    "type": "bool",
+    "default": false,
+    "hint": "排障时开启。"
+  }
+}
