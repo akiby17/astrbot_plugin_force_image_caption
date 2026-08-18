@@ -1,5 +1,5 @@
 name: astrbot_plugin_force_image_caption
-display_name: Force Image Caption
+display_name: Force Image Caption - 强制图片转述
 short_desc: 为纯文本主模型自动补充图片理解，无需“描述图片”等关键词。
 desc: |
   检测当前 LLM 请求中的图片，自动调用视觉模型生成描述，
