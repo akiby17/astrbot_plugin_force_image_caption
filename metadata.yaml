@@ -4,7 +4,7 @@ short_desc: 为纯文本主模型自动补充图片理解，无需“描述图�
 desc: |
   检测当前 LLM 请求中的图片，自动调用视觉模型生成描述，
   再将描述直接交给纯文本主模型。支持当前图片、引用图片及多图场景。
-version: 1.0.0
+version: 1.0.1
 author: akiby17
 repo: https://github.com/akiby17/astrbot_plugin_force_image_caption
 astrbot_version: ">=4.23,<5"
