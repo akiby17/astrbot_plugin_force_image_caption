@@ -18,6 +18,10 @@ class ForceImageCaption(Star):
         r"<image_caption>(.*?)</image_caption>",
         re.IGNORECASE | re.DOTALL,
     )
+    FAILURE_RE = re.compile(
+        r"\[\s*Image\s+Captioning\s+Failed\s*\]",
+        re.IGNORECASE,
+    )
 
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
@@ -55,11 +59,36 @@ class ForceImageCaption(Star):
             return prompt
 
         return (
-            "请识别并简洁描述用户发送的图片，供另一个无法直接看图的聊天模型理解。"
-            "说明主要人物、物体、场景、动作和重要文字；"
-            "如果是表情包、梗图或聊天截图，也说明其主要含义和情绪。"
-            "不要回答用户，只输出图片描述。"
+            "把自己当成刚刚看了一眼朋友发来的图片，理解它想表达什么。"
+            "不要逐项描述画面，不要使用‘图片中’‘画面里’‘可以看到’‘这是一张’等解说式表达。"
+            "优先提取后续聊天真正需要的信息：情绪、动作、梗、态度、关键文字或截图中的重点。"
+            "表情包重点理解情绪和意思；截图重点提取与当前聊天有关的信息。"
+            "只输出1～2句简短自然的理解结果，不要直接回复用户。"
         )
+
+    def _max_retries(self) -> int:
+        try:
+            return max(0, min(int(self.config.get("max_retries", 2)), 10))
+        except (TypeError, ValueError):
+            return 2
+
+    def _retry_delay(self) -> float:
+        try:
+            return max(0.0, min(float(self.config.get("retry_delay_seconds", 1.0)), 30.0))
+        except (TypeError, ValueError):
+            return 1.0
+
+    def _retry_backoff(self) -> float:
+        try:
+            return max(1.0, min(float(self.config.get("retry_backoff", 1.8)), 5.0))
+        except (TypeError, ValueError):
+            return 1.8
+
+    def _caption_timeout(self) -> int:
+        try:
+            return max(5, min(int(self.config.get("caption_timeout_seconds", 60)), 300))
+        except (TypeError, ValueError):
+            return 60
 
     @staticmethod
     def _part_text(part: Any) -> str:
@@ -84,7 +113,59 @@ class ForceImageCaption(Star):
 
         return "\n".join(dict.fromkeys(captions)).strip()
 
-    def _remove_caption_parts(self, req: ProviderRequest) -> None:
+    def _inject_silent_fallback_hint(self, req: ProviderRequest) -> None:
+        """Keep the final model from exposing internal image-processing failure.
+
+        The hint intentionally does not say that image recognition failed. It only
+        constrains the final answer to available text and hides modality/internal
+        processing status from the user. On AstrBot >= 4.24 it is marked temporary
+        so it will not be persisted into conversation history.
+        """
+        if not self.config.get("suppress_failure_reply", True):
+            return
+
+        hint = (
+            "<runtime_hint>"
+            "本轮只依据当前可用的文本信息自然回复。"
+            "不要讨论图片是否可见、识图状态或任何内部处理过程，"
+            "也不要编造未提供的视觉细节。"
+            "</runtime_hint>"
+        )
+
+        for part in getattr(req, "extra_user_content_parts", []) or []:
+            if "<runtime_hint>" in self._part_text(part):
+                return
+
+        try:
+            from astrbot.core.agent.message import TextPart
+
+            part = TextPart(text=hint)
+            mark_temp = getattr(part, "mark_as_temp", None)
+            if callable(mark_temp):
+                marked = mark_temp()
+                if marked is not None:
+                    part = marked
+            req.extra_user_content_parts.append(part)
+            return
+        except Exception as exc:
+            if self.config.get("debug_log", False):
+                logger.debug(
+                    "[ForceImageCaption] failed to add temporary fallback hint: %s",
+                    exc,
+                )
+
+        # Compatibility fallback for older AstrBot versions.
+        prompt = getattr(req, "prompt", "")
+        prompt = prompt if isinstance(prompt, str) else ""
+        if "<runtime_hint>" not in prompt:
+            req.prompt = f"{prompt.rstrip()}\n\n{hint}".strip()
+
+    def _strip_failure_markers(self, req: ProviderRequest) -> None:
+        """Remove AstrBot's visible image-caption failure marker from this request."""
+        prompt = getattr(req, "prompt", "")
+        if isinstance(prompt, str) and prompt:
+            req.prompt = self.FAILURE_RE.sub("", prompt).strip()
+
         parts = getattr(req, "extra_user_content_parts", None)
         if not isinstance(parts, list):
             return
@@ -92,13 +173,43 @@ class ForceImageCaption(Star):
         cleaned = []
         for part in parts:
             text = self._part_text(part)
-            if "<image_caption>" in text.lower():
-                continue
-            if "[Image Captioning Failed]" in text:
-                continue
+            if text and self.FAILURE_RE.search(text):
+                # Do not let the text-only main model see a visible failure marker.
+                # If this part contains only the marker, drop it completely.
+                remaining = self.FAILURE_RE.sub("", text).strip()
+                if not remaining:
+                    continue
+                try:
+                    part.text = remaining
+                except Exception:
+                    continue
             cleaned.append(part)
 
         req.extra_user_content_parts = cleaned
+
+    def _remove_caption_parts(self, req: ProviderRequest) -> None:
+        parts = getattr(req, "extra_user_content_parts", None)
+        if not isinstance(parts, list):
+            self._strip_failure_markers(req)
+            return
+
+        cleaned = []
+        for part in parts:
+            text = self._part_text(part)
+            if "<image_caption>" in text.lower():
+                continue
+            if self.FAILURE_RE.search(text):
+                remaining = self.FAILURE_RE.sub("", text).strip()
+                if not remaining:
+                    continue
+                try:
+                    part.text = remaining
+                except Exception:
+                    continue
+            cleaned.append(part)
+
+        req.extra_user_content_parts = cleaned
+        self._strip_failure_markers(req)
 
     @staticmethod
     def _inject_caption_into_prompt(req: ProviderRequest, caption: str) -> None:
@@ -209,6 +320,7 @@ class ForceImageCaption(Star):
     def _is_retryable(exc: Exception) -> bool:
         text = str(exc).lower()
 
+        # These usually cannot be fixed by sending the exact same request again.
         non_retryable = (
             "400",
             "401",
@@ -220,6 +332,7 @@ class ForceImageCaption(Star):
             "invalid_request",
             "rate_limit",
             "sensitive",
+            "content policy",
         )
         if any(token in text for token in non_retryable):
             return False
@@ -229,6 +342,8 @@ class ForceImageCaption(Star):
             "timed out",
             "connection",
             "temporarily",
+            "reset by peer",
+            "eof",
             "500",
             "502",
             "503",
@@ -247,9 +362,65 @@ class ForceImageCaption(Star):
                 prompt=prompt,
                 image_urls=images,
             ),
-            timeout=60,
+            timeout=self._caption_timeout(),
         )
         return str(getattr(response, "completion_text", "") or "").strip()
+
+    async def _caption_with_retries(
+        self,
+        provider: Any,
+        prompt: str,
+        images: list[str],
+        *,
+        label: str,
+    ) -> str:
+        """Caption one image set, retrying transient failures and optional empty replies."""
+        max_retries = self._max_retries()
+        retry_empty = bool(self.config.get("retry_on_empty_caption", True))
+        delay = self._retry_delay()
+        backoff = self._retry_backoff()
+        last_exc: Exception | None = None
+
+        for attempt in range(max_retries + 1):
+            try:
+                text = await self._caption_once(provider, prompt, images)
+                if text:
+                    if self.config.get("debug_log", False) and attempt:
+                        logger.info(
+                            "[ForceImageCaption] %s succeeded after retry attempt=%d/%d",
+                            label,
+                            attempt,
+                            max_retries,
+                        )
+                    return text
+
+                if not retry_empty:
+                    return ""
+                last_exc = RuntimeError("图片转述模型返回空内容")
+            except Exception as exc:
+                last_exc = exc
+                if not self._is_retryable(exc):
+                    raise
+
+            if attempt >= max_retries:
+                break
+
+            wait_seconds = delay * (backoff ** attempt)
+            if self.config.get("debug_log", False):
+                logger.warning(
+                    "[ForceImageCaption] %s failed, retry %d/%d in %.2fs: %s",
+                    label,
+                    attempt + 1,
+                    max_retries,
+                    wait_seconds,
+                    last_exc,
+                )
+            if wait_seconds > 0:
+                await asyncio.sleep(wait_seconds)
+
+        if last_exc is not None:
+            raise last_exc
+        return ""
 
     async def _generate_caption(
         self,
@@ -263,30 +434,45 @@ class ForceImageCaption(Star):
 
         prompt = self._caption_prompt(event)
 
+        batch_exc: Exception | None = None
         try:
-            return await self._caption_once(provider, prompt, images)
+            return await self._caption_with_retries(
+                provider,
+                prompt,
+                images,
+                label="batch",
+            )
         except Exception as exc:
-            if self._is_retryable(exc):
-                await asyncio.sleep(0.8)
+            batch_exc = exc
+
+        # If multiple images fail as one request, rescue them one by one.
+        if len(images) > 1 and self.config.get("split_multi_image_on_failure", True):
+            captions: list[str] = []
+            for index, image in enumerate(images, 1):
                 try:
-                    return await self._caption_once(provider, prompt, images)
-                except Exception as retry_exc:
-                    exc = retry_exc
+                    text = await self._caption_with_retries(
+                        provider,
+                        prompt,
+                        [image],
+                        label=f"image-{index}",
+                    )
+                except Exception as exc:
+                    if self.config.get("debug_log", False):
+                        logger.warning(
+                            "[ForceImageCaption] image-%d failed after retries: %s",
+                            index,
+                            exc,
+                        )
+                    continue
+                if text:
+                    captions.append(f"图片{index}：{text}")
 
-            if len(images) > 1:
-                captions: list[str] = []
-                for index, image in enumerate(images, 1):
-                    try:
-                        text = await self._caption_once(provider, prompt, [image])
-                    except Exception:
-                        continue
-                    if text:
-                        captions.append(f"图片{index}：{text}")
+            if captions:
+                return "\n".join(captions)
 
-                if captions:
-                    return "\n".join(captions)
-
-            raise exc
+        if batch_exc is not None:
+            raise batch_exc
+        return ""
 
     @filter.on_llm_request(priority=-999999)
     async def force_image_caption(
@@ -296,6 +482,11 @@ class ForceImageCaption(Star):
     ):
         if not self.config.get("enabled", True):
             return
+
+        # AstrBot's built-in caption path may have failed before this late hook.
+        # Never expose its visible failure marker to the final text model.
+        if self.config.get("silent_failure", True):
+            self._strip_failure_markers(req)
 
         existing = self._existing_caption(req)
         if existing:
@@ -322,9 +513,14 @@ class ForceImageCaption(Star):
         if not provider_id:
             logger.warning(
                 "[ForceImageCaption] 检测到图片，但未配置图片转述模型。"
-                "请在 AstrBot 中选择“默认图片转述模型”，"
+                "请在 AstrBot 中选择‘默认图片转述模型’，"
                 "或在插件配置中填写 Provider ID。"
             )
+            if self.config.get("silent_failure", True):
+                self._strip_failure_markers(req)
+            self._inject_silent_fallback_hint(req)
+            if self.config.get("remove_images_on_failure", True):
+                req.image_urls = []
             return
 
         try:
@@ -335,18 +531,31 @@ class ForceImageCaption(Star):
             )
         except Exception as exc:
             logger.error(
-                "[ForceImageCaption] 图片转述失败 provider=%s images=%d error=%s",
+                "[ForceImageCaption] 图片转述失败，已结束重试 provider=%s images=%d retries=%d error=%s",
                 provider_id,
                 len(images),
+                self._max_retries(),
                 exc,
             )
 
-            if self.config.get("remove_images_on_failure", False):
+            # Important: do not leave AstrBot's "[Image Captioning Failed]"
+            # in the final request, otherwise the main model tends to reply
+            # with "没看到图片/无法识别图片".
+            if self.config.get("silent_failure", True):
+                self._strip_failure_markers(req)
+            self._inject_silent_fallback_hint(req)
+
+            if self.config.get("remove_images_on_failure", True):
                 req.image_urls = []
             return
 
         if not caption:
-            logger.warning("[ForceImageCaption] 图片转述模型返回空内容。")
+            logger.warning("[ForceImageCaption] 图片转述模型最终仍返回空内容。")
+            if self.config.get("silent_failure", True):
+                self._strip_failure_markers(req)
+            self._inject_silent_fallback_hint(req)
+            if self.config.get("remove_images_on_failure", True):
+                req.image_urls = []
             return
 
         self._inject_caption_into_prompt(req, caption)
@@ -369,5 +578,7 @@ class ForceImageCaption(Star):
         yield event.plain_result(
             "Force Image Caption\n"
             f"状态：{'启用' if self.config.get('enabled', True) else '关闭'}\n"
-            f"图片转述模型：{provider_id}"
+            f"图片转述模型：{provider_id}\n"
+            f"失败重试：{self._max_retries()} 次\n"
+            f"静默失败：{'开启' if self.config.get('silent_failure', True) else '关闭'}"
         )

@@ -12,10 +12,46 @@
     "hint": "留空时使用 AstrBot 的“默认图片转述模型”。"
   },
   "caption_prompt": {
-    "description": "图片转述提示词",
+    "description": "图片理解提示词",
     "type": "text",
-    "default": "请识别并简洁描述用户发送的图片，供另一个无法直接看图的聊天模型理解。说明主要人物、物体、场景、动作和重要文字；如果是表情包、梗图或聊天截图，也说明其主要含义和情绪。不要回答用户，只输出图片描述。",
-    "hint": "无需用户主动说“识图”“描述图片”等关键词。"
+    "default": "把自己当成刚刚看了一眼朋友发来的图片，理解它想表达什么。不要逐项描述画面，不要使用‘图片中’‘画面里’‘可以看到’‘这是一张’等解说式表达。优先提取后续聊天真正需要的信息：情绪、动作、梗、态度、关键文字或截图中的重点。表情包重点理解情绪和意思；截图重点提取与当前聊天有关的信息。只输出1～2句简短自然的理解结果，不要直接回复用户。",
+    "hint": "这段内容只用于视觉模型理解图片，不需要用户说“识图”“描述图片”等关键词。"
+  },
+  "max_retries": {
+    "description": "识图失败最大重试次数",
+    "type": "int",
+    "default": 2,
+    "hint": "不含首次请求。例如设为2，最多会尝试3次。仅对超时、连接错误、5xx和空响应等临时失败重试；422/429等通常不会重复请求。"
+  },
+  "retry_delay_seconds": {
+    "description": "首次重试等待时间（秒）",
+    "type": "float",
+    "default": 1.0,
+    "hint": "第一次重试前等待多久。后续会按退避倍率逐渐延长。"
+  },
+  "retry_backoff": {
+    "description": "重试退避倍率",
+    "type": "float",
+    "default": 1.8,
+    "hint": "例如1秒、1.8秒、3.24秒。建议保持1.5～2.0。"
+  },
+  "caption_timeout_seconds": {
+    "description": "单次识图超时（秒）",
+    "type": "int",
+    "default": 60,
+    "hint": "单次视觉模型请求的最长等待时间。"
+  },
+  "retry_on_empty_caption": {
+    "description": "空响应也自动重试",
+    "type": "bool",
+    "default": true,
+    "hint": "视觉模型没有报错但返回空内容时，也按失败处理并重试。"
+  },
+  "split_multi_image_on_failure": {
+    "description": "多图失败后逐张重试",
+    "type": "bool",
+    "default": true,
+    "hint": "多张图片一起识别失败时，再逐张识别；每张图也会应用上面的重试次数。"
   },
   "remove_images_from_main_model": {
     "description": "转述成功后移除原图",
@@ -24,15 +60,27 @@
     "hint": "DeepSeek 等纯文本主模型建议保持开启。"
   },
   "remove_images_on_failure": {
-    "description": "转述失败时也移除原图",
+    "description": "全部重试失败后移除原图",
     "type": "bool",
-    "default": false,
-    "hint": "通常关闭；若主模型完全不能接收图片且会因此报错，可开启。"
+    "default": true,
+    "hint": "纯文本主模型建议开启，避免识图失败后原图继续传给主模型导致报错。"
+  },
+  "silent_failure": {
+    "description": "识图失败时静默处理",
+    "type": "bool",
+    "default": true,
+    "hint": "开启后会清理 AstrBot 产生的 [Image Captioning Failed] 等失败标记，不把“没看到图片/识图失败”这类内部状态交给主模型。日志仍会记录失败原因。"
+  },
+  "suppress_failure_reply": {
+    "description": "全部重试失败后不向用户反馈“没看到图片”",
+    "type": "bool",
+    "default": true,
+    "hint": "开启后会给主模型添加一条仅本轮生效的内部约束：只根据现有文字自然回复，不讨论图片是否可见或识图状态，也不编造视觉内容。AstrBot 4.24+ 会将该约束标记为临时内容，不写入会话历史。"
   },
   "debug_log": {
     "description": "调试日志",
     "type": "bool",
     "default": false,
-    "hint": "排障时开启。"
+    "hint": "开启后会记录每次重试、等待时间和多图逐张恢复情况。"
   }
 }
