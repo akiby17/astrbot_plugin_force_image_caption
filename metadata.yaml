@@ -4,7 +4,7 @@ short_desc: 自动为纯文本主模型补充图片理解，支持失败重试�
 desc: |
   自动调用视觉模型理解当前图片，再将结果交给纯文本主模型。
   支持当前图片、引用图片、多图、失败重试与静默降级。
-version: 1.1.0
+version: 1.1.1
 author: akiby17
 repo: https://github.com/akiby17/astrbot_plugin_force_image_caption
 astrbot_version: ">=4.23,<5"
