@@ -1,4 +1,4 @@
-# Force Image Caption
+# Force Image Caption 强制图片转述
 
 为 **DeepSeek 等纯文本主模型** 自动补充图片理解。
 
