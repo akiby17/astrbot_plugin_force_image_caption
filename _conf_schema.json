@@ -23,6 +23,18 @@
     "default": true,
     "hint": "开启后，即使用户先单独发图、下一条才提问，插件也能复用最近图片继续识别。仅缓存图片引用，不复制图片二进制。"
   },
+  "persist_recent_images": {
+    "description": "将临时图片复制到插件持久缓存",
+    "type": "bool",
+    "default": true,
+    "hint": "建议开启。AstrBot 的 data/temp 图片可能在后续工具调用前被清理；开启后会复制到 data/plugin_data/astrbot_plugin_force_image_caption/recent_images，并尽量改写当前 Image 组件，使表情包小偷等下游插件仍能找到原图。"
+  },
+  "persistent_cache_dir": {
+    "description": "临时图片持久缓存目录（可留空）",
+    "type": "string",
+    "default": "",
+    "hint": "通常留空即可。默认使用 AstrBot/data/plugin_data/astrbot_plugin_force_image_caption/recent_images。仅在自定义数据目录时填写绝对路径。"
+  },
   "recent_image_ttl_seconds": {
     "description": "最近图片记忆有效期（秒）",
     "type": "int",

@@ -1,8 +1,12 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import os
 import re
+import shutil
 import time
+from pathlib import Path
 from typing import Any
 
 from astrbot.api import AstrBotConfig, logger
@@ -31,6 +35,8 @@ class ForceImageCaption(Star):
         # Only lightweight image references are kept in memory; no image bytes are copied.
         self._recent_images: dict[str, dict[str, Any]] = {}
         self._recent_images_lock = asyncio.Lock()
+        self._persist_lock = asyncio.Lock()
+        self._last_persist_cleanup_ts = 0.0
 
     def _provider_settings(self, event: AstrMessageEvent) -> dict[str, Any]:
         try:
@@ -109,6 +115,269 @@ class ForceImageCaption(Star):
             return max(1, min(int(self.config.get("recent_image_max_count", 4)), 12))
         except (TypeError, ValueError):
             return 4
+
+    def _persist_recent_images_enabled(self) -> bool:
+        return bool(self.config.get("persist_recent_images", True))
+
+    def _persistent_cache_root(self) -> Path:
+        configured = str(self.config.get("persistent_cache_dir", "") or "").strip()
+        if configured:
+            return Path(configured).expanduser().resolve()
+        # AstrBot normally runs with /AstrBot as CWD. Keeping the cache under
+        # data/plugin_data makes it survive the framework's data/temp cleanup.
+        return (
+            Path.cwd()
+            / "data"
+            / "plugin_data"
+            / "astrbot_plugin_force_image_caption"
+            / "recent_images"
+        ).resolve()
+
+    @staticmethod
+    def _ref_to_local_path(ref: str) -> Path | None:
+        if not isinstance(ref, str):
+            return None
+        value = ref.strip()
+        if not value or value.lower().startswith(("http://", "https://", "data:")):
+            return None
+        if value.lower().startswith("file:///"):
+            value = value[8:]
+            # Windows file:///C:/... compatibility.
+            if len(value) > 2 and value[0] == "/" and value[2] == ":":
+                value = value[1:]
+        try:
+            return Path(value).expanduser().resolve()
+        except Exception:
+            return None
+
+    def _session_persistent_dir(self, event: AstrMessageEvent) -> Path:
+        key = self._session_key(event).encode("utf-8", errors="ignore")
+        digest = hashlib.sha1(key).hexdigest()[:16]
+        return self._persistent_cache_root() / digest
+
+    async def _cleanup_persistent_cache(self, *, force: bool = False) -> None:
+        if not self._persist_recent_images_enabled():
+            return
+        now = time.time()
+        if not force and now - self._last_persist_cleanup_ts < 60:
+            return
+        self._last_persist_cleanup_ts = now
+        root = self._persistent_cache_root()
+        if not root.exists():
+            return
+        # Keep a grace period beyond the in-memory TTL so a tool call that starts
+        # near the TTL boundary does not lose its file mid-flight.
+        max_age = max(self._recent_image_ttl() + 120, 300)
+
+        def _cleanup() -> None:
+            try:
+                for file in root.rglob("*"):
+                    if not file.is_file():
+                        continue
+                    try:
+                        age = now - file.stat().st_mtime
+                    except OSError:
+                        continue
+                    if age > max_age:
+                        try:
+                            file.unlink()
+                        except OSError:
+                            pass
+                # Remove empty session directories bottom-up.
+                for folder in sorted(
+                    (x for x in root.rglob("*") if x.is_dir()),
+                    key=lambda x: len(x.parts),
+                    reverse=True,
+                ):
+                    try:
+                        folder.rmdir()
+                    except OSError:
+                        pass
+            except Exception:
+                pass
+
+        await asyncio.to_thread(_cleanup)
+
+    async def _persist_local_image_ref(
+        self,
+        event: AstrMessageEvent,
+        ref: str,
+    ) -> str:
+        """Copy an AstrBot temp image to plugin_data and keep its basename.
+
+        Keeping the basename is deliberate: astrbot_plugin_stealer resolves an
+        LLM-provided stale temp path against the current Image component by
+        basename. Rewriting the component to this persistent copy therefore lets
+        that tool recover instead of failing with "图片文件不存在".
+        """
+        if not self._persist_recent_images_enabled():
+            return ref
+        source = self._ref_to_local_path(ref)
+        if source is None or not source.exists() or not source.is_file():
+            return ref
+        root = self._persistent_cache_root()
+        try:
+            source.relative_to(root)
+            return str(source)
+        except ValueError:
+            pass
+
+        target_dir = self._session_persistent_dir(event)
+        target = target_dir / source.name
+
+        def _copy() -> str:
+            target_dir.mkdir(parents=True, exist_ok=True)
+            # If the same temp filename is observed twice, replacing the cache copy
+            # is safe and keeps basename-based recovery deterministic.
+            shutil.copy2(source, target)
+            return str(target.resolve())
+
+        try:
+            async with self._persist_lock:
+                value = await asyncio.to_thread(_copy)
+            await self._cleanup_persistent_cache()
+            return value
+        except Exception as exc:
+            if self.config.get("debug_log", False):
+                logger.debug(
+                    "[ForceImageCaption] failed to persist temp image %s: %s",
+                    ref,
+                    exc,
+                )
+            return ref
+
+    async def _image_components(
+        self,
+        components: Any,
+        *,
+        depth: int = 0,
+        seen: set[int] | None = None,
+    ) -> list[Image]:
+        if depth > 3 or not isinstance(components, (list, tuple)):
+            return []
+        if seen is None:
+            seen = set()
+        result: list[Image] = []
+        for comp in components:
+            obj_id = id(comp)
+            if obj_id in seen:
+                continue
+            seen.add(obj_id)
+            if isinstance(comp, Image):
+                result.append(comp)
+                continue
+            if isinstance(comp, Reply):
+                result.extend(
+                    await self._image_components(
+                        getattr(comp, "chain", None),
+                        depth=depth + 1,
+                        seen=seen,
+                    )
+                )
+            for attr in ("chain", "message", "content", "nodes"):
+                nested = getattr(comp, attr, None)
+                if isinstance(nested, (list, tuple)):
+                    result.extend(
+                        await self._image_components(
+                            nested,
+                            depth=depth + 1,
+                            seen=seen,
+                        )
+                    )
+        return result
+
+    async def _persist_event_images(self, event: AstrMessageEvent) -> list[str]:
+        """Persist local Image components and rewrite them to stable paths.
+
+        AstrBot may delete files in data/temp before an LLM tool executes. The
+        rewrite is best-effort and intentionally happens on the same event object,
+        allowing downstream plugins (notably stealer's steal_meme tool) to resolve
+        the stale basename back to a still-existing file.
+        """
+        if not self._persist_recent_images_enabled():
+            return []
+        try:
+            chain = event.message_obj.message
+        except Exception:
+            return []
+        comps = await self._image_components(chain)
+        persisted: list[str] = []
+        for comp in comps:
+            candidates: list[str] = []
+            for attr in ("url", "file", "path"):
+                value = getattr(comp, attr, None)
+                if isinstance(value, str) and value.strip():
+                    candidates.append(value.strip())
+            try:
+                local = await comp.convert_to_file_path()
+                if isinstance(local, str) and local.strip():
+                    candidates.append(local.strip())
+            except Exception:
+                pass
+
+            local_ref = next(
+                (
+                    ref
+                    for ref in candidates
+                    if (lambda p: p is not None and p.exists() and p.is_file())(
+                        self._ref_to_local_path(ref)
+                    )
+                ),
+                "",
+            )
+            if not local_ref:
+                continue
+            stable = await self._persist_local_image_ref(event, local_ref)
+            stable_path = self._ref_to_local_path(stable)
+            if stable == local_ref or stable_path is None or not stable_path.exists():
+                continue
+            persisted.append(stable)
+
+            original_path = self._ref_to_local_path(local_ref)
+            original_name = original_path.name if original_path else Path(local_ref).name
+            wrote = False
+            for attr in ("url", "file", "path"):
+                try:
+                    current = getattr(comp, attr, None)
+                except Exception:
+                    continue
+                current_path = self._ref_to_local_path(current) if isinstance(current, str) else None
+                same_original = bool(
+                    current_path
+                    and original_path
+                    and os.path.normcase(str(current_path)) == os.path.normcase(str(original_path))
+                )
+                same_basename = bool(
+                    current_path
+                    and original_name
+                    and current_path.name == original_name
+                )
+                if same_original or same_basename:
+                    try:
+                        setattr(comp, attr, stable)
+                        wrote = True
+                    except Exception:
+                        pass
+            if not wrote:
+                # Many AstrBot Image components are mutable dataclasses. Even when
+                # the original local path came only from convert_to_file_path(),
+                # adding file/path gives downstream plugins a stable candidate.
+                for attr in ("file", "path"):
+                    try:
+                        setattr(comp, attr, stable)
+                        wrote = True
+                        break
+                    except Exception:
+                        continue
+
+            if self.config.get("debug_log", False):
+                logger.info(
+                    "[ForceImageCaption] persisted temp image for downstream tools old=%s new=%s rewritten=%s",
+                    local_ref,
+                    stable,
+                    wrote,
+                )
+        return self._dedupe(persisted)
 
     def _followup_context_max_chars(self) -> int:
         try:
@@ -511,9 +780,43 @@ class ForceImageCaption(Star):
             for v in (getattr(req, "image_urls", None) or [])
             if isinstance(v, str) and v.strip()
         ]
-
         event_images = await self._event_images(event)
-        return self._dedupe(req_images + event_images)
+
+        # A framework temp path may already have disappeared while the Image
+        # component has been rewritten to our persistent copy. Replace stale refs
+        # by basename before sending them to the vision provider.
+        event_by_name: dict[str, str] = {}
+        for ref in event_images:
+            path = self._ref_to_local_path(ref)
+            if path is not None and path.exists():
+                event_by_name[path.name] = ref
+
+        normalized_req: list[str] = []
+        for ref in req_images:
+            local = self._ref_to_local_path(ref)
+            if local is None:
+                normalized_req.append(ref)
+                continue
+            if local.exists():
+                normalized_req.append(ref)
+                continue
+            replacement = event_by_name.get(local.name)
+            if replacement:
+                normalized_req.append(replacement)
+                if self.config.get("debug_log", False):
+                    logger.info(
+                        "[ForceImageCaption] replaced stale request image ref by persistent copy basename=%s",
+                        local.name,
+                    )
+            elif self.config.get("debug_log", False):
+                logger.debug(
+                    "[ForceImageCaption] dropped stale local request image ref: %s",
+                    ref,
+                )
+
+        # Event refs first: if the same image exists as both a stale framework
+        # reference and a stable plugin_data copy, the stable one wins.
+        return self._dedupe(event_images + normalized_req)
 
     @staticmethod
     def _is_retryable(exc: Exception) -> bool:
@@ -684,7 +987,8 @@ class ForceImageCaption(Star):
         if not self.config.get("enabled", True) or not self._recent_memory_enabled():
             return
         try:
-            images = await self._event_images(event)
+            persisted = await self._persist_event_images(event)
+            images = persisted or await self._event_images(event)
             if images:
                 await self._remember_images(event, images)
         except Exception as exc:
@@ -704,6 +1008,12 @@ class ForceImageCaption(Star):
         # Never expose its visible failure marker to the final text model.
         if self.config.get("silent_failure", True):
             self._strip_failure_markers(req)
+
+        # Persist framework temp images before resolving refs. AstrBot may clean
+        # data/temp before a downstream LLM tool (for example stealer's steal_meme)
+        # actually runs; rewriting the current Image component here keeps that tool
+        # from receiving a dead path.
+        await self._persist_event_images(event)
 
         # Resolve and remember the current image before any early return. This is
         # important when AstrBot has already generated a caption for the current turn:
@@ -836,6 +1146,7 @@ class ForceImageCaption(Star):
             f"失败重试：{self._max_retries()} 次\n"
             f"静默失败：{'开启' if self.config.get('silent_failure', True) else '关闭'}\n"
             f"最近图片记忆：{'开启' if self._recent_memory_enabled() else '关闭'}\n"
+            f"临时图持久化：{'开启' if self._persist_recent_images_enabled() else '关闭'}\n"
             f"追问复用：{'仅疑似图片追问' if followup_only else 'TTL 内所有 LLM 请求'}\n"
             f"记忆有效期：{self._recent_image_ttl()} 秒\n"
             f"本会话缓存：{len(recent)} 张"
@@ -852,3 +1163,7 @@ class ForceImageCaption(Star):
     async def terminate(self):
         async with self._recent_images_lock:
             self._recent_images.clear()
+        try:
+            await self._cleanup_persistent_cache(force=True)
+        except Exception:
+            pass

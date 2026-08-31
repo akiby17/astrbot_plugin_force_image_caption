@@ -1,5 +1,25 @@
 # Changelog
 
+## 1.2.1 - 2026-08-31
+
+### 修复
+
+- 修复 AstrBot 临时图片位于 `data/temp` 时，后续 LLM 工具调用执行较晚导致原文件已被清理、出现“图片文件不存在”的问题。
+- 新增**临时图持久化**：收到本地临时图片后，会复制到插件自己的 `data/plugin_data/astrbot_plugin_force_image_caption/recent_images/` 缓存目录。
+- 持久化时保留原始文件名，并尽量改写当前消息中的 `Image.url/file/path`。这样 `astrbot_plugin_stealer` 的 `steal_meme` 即使拿到已经失效的旧临时路径，也可以按 basename 从当前消息中解析到仍然存在的持久副本。
+- 修复 `ProviderRequest.image_urls` 仍残留失效临时路径时可能拖累视觉模型请求的问题：会优先用当前消息中同名的持久副本替换，无法替换的失效本地路径会被丢弃。
+- 最近图片跨消息记忆现在优先保存持久副本，不再依赖 AstrBot 临时目录的文件生命周期。
+
+### 新增配置
+
+- `persist_recent_images`：是否把本地临时图片复制到插件持久缓存，默认开启。
+- `persistent_cache_dir`：自定义持久缓存目录，默认留空并使用 AstrBot `data/plugin_data`。
+
+### 清理策略
+
+- 持久缓存会按最近图片 TTL 加安全宽限时间自动清理，避免长期运行无限积累。
+- `/force_caption_status` 增加“临时图持久化”状态。
+
 ## 1.2.0 - 2026-08-31
 
 ### 新增
