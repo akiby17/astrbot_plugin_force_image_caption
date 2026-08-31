@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import re
+import time
 from typing import Any
 
 from astrbot.api import AstrBotConfig, logger
@@ -26,6 +27,10 @@ class ForceImageCaption(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
         self.config = config
+        # session_key -> {"ts": float, "images": list[str], "message_id": str}
+        # Only lightweight image references are kept in memory; no image bytes are copied.
+        self._recent_images: dict[str, dict[str, Any]] = {}
+        self._recent_images_lock = asyncio.Lock()
 
     def _provider_settings(self, event: AstrMessageEvent) -> dict[str, Any]:
         try:
@@ -89,6 +94,27 @@ class ForceImageCaption(Star):
             return max(5, min(int(self.config.get("caption_timeout_seconds", 60)), 300))
         except (TypeError, ValueError):
             return 60
+
+    def _recent_memory_enabled(self) -> bool:
+        return bool(self.config.get("remember_recent_images", True))
+
+    def _recent_image_ttl(self) -> int:
+        try:
+            return max(10, min(int(self.config.get("recent_image_ttl_seconds", 300)), 3600))
+        except (TypeError, ValueError):
+            return 300
+
+    def _recent_image_max_count(self) -> int:
+        try:
+            return max(1, min(int(self.config.get("recent_image_max_count", 4)), 12))
+        except (TypeError, ValueError):
+            return 4
+
+    def _followup_context_max_chars(self) -> int:
+        try:
+            return max(0, min(int(self.config.get("followup_context_max_chars", 300)), 1500))
+        except (TypeError, ValueError):
+            return 300
 
     @staticmethod
     def _part_text(part: Any) -> str:
@@ -225,6 +251,179 @@ class ForceImageCaption(Star):
     @staticmethod
     def _dedupe(values: list[str]) -> list[str]:
         return list(dict.fromkeys(v for v in values if isinstance(v, str) and v))
+
+    @staticmethod
+    def _session_key(event: AstrMessageEvent) -> str:
+        umo = getattr(event, "unified_msg_origin", "")
+        if isinstance(umo, str) and umo.strip():
+            return umo.strip()
+
+        obj = getattr(event, "message_obj", None)
+        session_id = getattr(obj, "session_id", "") if obj is not None else ""
+        if session_id:
+            return str(session_id)
+
+        try:
+            group_id = event.get_group_id()
+        except Exception:
+            group_id = ""
+        try:
+            sender_id = event.get_sender_id()
+        except Exception:
+            sender_id = ""
+        return f"fallback:{group_id}:{sender_id}"
+
+    @staticmethod
+    def _message_id(event: AstrMessageEvent) -> str:
+        obj = getattr(event, "message_obj", None)
+        value = getattr(obj, "message_id", "") if obj is not None else ""
+        return str(value or "")
+
+    @staticmethod
+    def _cacheable_image_ref(ref: str) -> bool:
+        if not isinstance(ref, str) or not ref.strip():
+            return False
+        # data: URLs can be several MB each. Keeping them for every session would
+        # turn a tiny follow-up cache into an unbounded memory sink.
+        return not ref.lstrip().lower().startswith("data:")
+
+    def _current_user_text(self, event: AstrMessageEvent) -> str:
+        candidates = [
+            getattr(event, "message_str", ""),
+            getattr(getattr(event, "message_obj", None), "message_str", ""),
+        ]
+        text = next((v for v in candidates if isinstance(v, str) and v.strip()), "")
+        if not text:
+            return ""
+
+        # Some adapters render non-text components as placeholders. They are not
+        # useful context for the vision model.
+        text = re.sub(r"\[\s*(?:图片|image)\s*\]", " ", text, flags=re.IGNORECASE)
+        text = re.sub(r"\s+", " ", text).strip()
+        limit = self._followup_context_max_chars()
+        if limit and len(text) > limit:
+            text = text[:limit].rstrip() + "…"
+        return text
+
+    @staticmethod
+    def _looks_like_image_followup(text: str) -> bool:
+        """Conservative heuristic for follow-ups such as “第二个是谁 / 这张呢”."""
+        if not isinstance(text, str):
+            return False
+        value = re.sub(r"\s+", "", text).lower()
+        if not value:
+            return False
+
+        explicit = (
+            "图片", "照片", "截图", "表情包", "表情", "图里", "图中", "画面",
+            "这张", "那张", "上一张", "刚才那张", "刚刚那张", "这幅", "那幅",
+            "左边", "右边", "中间", "上面", "下面", "前面", "后面",
+        )
+        if any(token in value for token in explicit):
+            return True
+
+        ordinal = re.search(r"第(?:[一二三四五六七八九十百两\d]+)(?:个|位|只|张|排|行|列)?", value)
+        interrogative = any(token in value for token in ("谁", "哪", "什么", "啥", "怎么", "是不是", "叫啥", "叫什"))
+        if ordinal and interrogative:
+            return True
+
+        demonstrative = re.search(r"(?:这个|那个|这人|那人|这位|那位|它|他|她|ta).{0,12}(?:是谁|谁|什么|啥|哪|怎么|干嘛|意思)", value)
+        if demonstrative:
+            return True
+
+        # Very short conversational follow-ups are common immediately after an
+        # image. Keep this list narrow to avoid attaching stale images to normal chat.
+        short_followups = {
+            "谁啊", "谁呀", "是谁", "这谁", "那谁", "这是谁", "那是谁",
+            "什么意思", "啥意思", "怎么回事", "这是啥", "这是什么", "那是什么",
+            "这个呢", "那个呢", "然后呢", "还有呢",
+        }
+        return len(value) <= 18 and value in short_followups
+
+    async def _remember_images(self, event: AstrMessageEvent, images: list[str]) -> None:
+        if not self._recent_memory_enabled():
+            return
+
+        cacheable = [v for v in self._dedupe(images) if self._cacheable_image_ref(v)]
+        if not cacheable:
+            if self.config.get("debug_log", False) and images:
+                logger.debug("[ForceImageCaption] recent-image cache skipped non-cacheable refs")
+            return
+
+        cacheable = cacheable[: self._recent_image_max_count()]
+        key = self._session_key(event)
+        now = time.time()
+        async with self._recent_images_lock:
+            self._recent_images[key] = {
+                "ts": now,
+                "images": cacheable,
+                "message_id": self._message_id(event),
+            }
+            # Opportunistic cleanup prevents long-running bots from accumulating
+            # one cache entry for every group/private chat ever seen.
+            ttl = self._recent_image_ttl()
+            if len(self._recent_images) > 256:
+                expired = [
+                    k for k, item in self._recent_images.items()
+                    if now - float(item.get("ts", 0.0) or 0.0) > ttl
+                ]
+                for k in expired:
+                    self._recent_images.pop(k, None)
+
+        if self.config.get("debug_log", False):
+            logger.info(
+                "[ForceImageCaption] remembered recent image(s) session=%s count=%d",
+                key,
+                len(cacheable),
+            )
+
+    async def _get_recent_images(self, event: AstrMessageEvent) -> tuple[list[str], float]:
+        if not self._recent_memory_enabled():
+            return [], 0.0
+
+        key = self._session_key(event)
+        now = time.time()
+        ttl = self._recent_image_ttl()
+        async with self._recent_images_lock:
+            item = self._recent_images.get(key)
+            if not item:
+                return [], 0.0
+            age = max(0.0, now - float(item.get("ts", 0.0) or 0.0))
+            if age > ttl:
+                self._recent_images.pop(key, None)
+                return [], age
+            images = list(item.get("images", []) or [])
+        return self._dedupe(images), age
+
+    async def _forget_recent_images(self, event: AstrMessageEvent) -> bool:
+        key = self._session_key(event)
+        async with self._recent_images_lock:
+            return self._recent_images.pop(key, None) is not None
+
+    def _caption_prompt_for_request(
+        self,
+        event: AstrMessageEvent,
+        *,
+        image_source: str,
+    ) -> str:
+        base = self._caption_prompt(event)
+        user_text = self._current_user_text(event)
+        if not user_text:
+            return base
+
+        source_hint = (
+            "这是用户刚才发过、现在继续追问的图片。"
+            if image_source == "recent"
+            else "这是用户当前消息携带或引用的图片。"
+        )
+        return (
+            f"{base}\n\n"
+            f"{source_hint}\n"
+            f"当前用户消息：{user_text}\n"
+            "请优先提取回答这句话所必需的视觉事实；如果问题涉及人物顺序、位置、"
+            "文字、动作或表情，要把相关信息说清楚。只输出供主聊天模型使用的视觉事实，"
+            "不要称呼用户，不要解释你的识图过程。"
+        )
 
     async def _image_ref(self, image: Image) -> str:
         url = getattr(image, "url", None)
@@ -427,12 +626,17 @@ class ForceImageCaption(Star):
         event: AstrMessageEvent,
         provider_id: str,
         images: list[str],
+        *,
+        image_source: str = "current",
     ) -> str:
         provider = self.context.get_provider_by_id(provider_id=provider_id)
         if provider is None:
             raise ValueError(f"找不到图片转述模型 Provider：{provider_id}")
 
-        prompt = self._caption_prompt(event)
+        prompt = self._caption_prompt_for_request(
+            event,
+            image_source=image_source,
+        )
 
         batch_exc: Exception | None = None
         try:
@@ -474,6 +678,19 @@ class ForceImageCaption(Star):
             raise batch_exc
         return ""
 
+    @filter.event_message_type(filter.EventMessageType.ALL)
+    async def remember_image_message(self, event: AstrMessageEvent):
+        """Remember images even when an image-only message does not trigger the LLM."""
+        if not self.config.get("enabled", True) or not self._recent_memory_enabled():
+            return
+        try:
+            images = await self._event_images(event)
+            if images:
+                await self._remember_images(event, images)
+        except Exception as exc:
+            if self.config.get("debug_log", False):
+                logger.debug("[ForceImageCaption] failed to remember event image: %s", exc)
+
     @filter.on_llm_request(priority=-999999)
     async def force_image_caption(
         self,
@@ -487,6 +704,13 @@ class ForceImageCaption(Star):
         # Never expose its visible failure marker to the final text model.
         if self.config.get("silent_failure", True):
             self._strip_failure_markers(req)
+
+        # Resolve and remember the current image before any early return. This is
+        # important when AstrBot has already generated a caption for the current turn:
+        # later turns can still refer back to the same image.
+        current_images = await self._resolve_images(event, req)
+        if current_images:
+            await self._remember_images(event, current_images)
 
         existing = self._existing_caption(req)
         if existing:
@@ -503,10 +727,36 @@ class ForceImageCaption(Star):
                 )
             return
 
-        images = await self._resolve_images(event, req)
+        images = current_images
+        image_source = "current"
+
+        if not images and self._recent_memory_enabled():
+            user_text = self._current_user_text(event)
+            followup_only = bool(self.config.get("recent_image_followup_only", True))
+            should_reuse = (not followup_only) or self._looks_like_image_followup(user_text)
+            if should_reuse:
+                recent_images, age = await self._get_recent_images(event)
+                if recent_images:
+                    images = recent_images
+                    image_source = "recent"
+                    if self.config.get("debug_log", False):
+                        logger.info(
+                            "[ForceImageCaption] reused recent image(s) for follow-up count=%d age=%.1fs text=%r",
+                            len(images),
+                            age,
+                            user_text[:80],
+                        )
+
         if not images:
+            user_text = self._current_user_text(event)
+            if self._looks_like_image_followup(user_text):
+                # A likely visual follow-up reached us without a usable current/recent
+                # image (for example, cache expired or the adapter did not expose the
+                # original image). Keep the main model from narrating internal
+                # modality failures; it can ask a natural clarification instead.
+                self._inject_silent_fallback_hint(req)
             if self.config.get("debug_log", False):
-                logger.info("[ForceImageCaption] no image found in this LLM request.")
+                logger.info("[ForceImageCaption] no usable image for this LLM request.")
             return
 
         provider_id = self._caption_provider_id(event)
@@ -528,6 +778,7 @@ class ForceImageCaption(Star):
                 event,
                 provider_id,
                 images,
+                image_source=image_source,
             )
         except Exception as exc:
             logger.error(
@@ -566,8 +817,9 @@ class ForceImageCaption(Star):
 
         if self.config.get("debug_log", False):
             logger.info(
-                "[ForceImageCaption] caption ready provider=%s images=%d length=%d",
+                "[ForceImageCaption] caption ready provider=%s source=%s images=%d length=%d",
                 provider_id,
+                image_source,
                 len(images),
                 len(caption),
             )
@@ -575,10 +827,28 @@ class ForceImageCaption(Star):
     @filter.command("force_caption_status")
     async def force_caption_status(self, event: AstrMessageEvent):
         provider_id = self._caption_provider_id(event) or "（未配置）"
+        recent, age = await self._get_recent_images(event)
+        followup_only = bool(self.config.get("recent_image_followup_only", True))
         yield event.plain_result(
             "Force Image Caption\n"
             f"状态：{'启用' if self.config.get('enabled', True) else '关闭'}\n"
             f"图片转述模型：{provider_id}\n"
             f"失败重试：{self._max_retries()} 次\n"
-            f"静默失败：{'开启' if self.config.get('silent_failure', True) else '关闭'}"
+            f"静默失败：{'开启' if self.config.get('silent_failure', True) else '关闭'}\n"
+            f"最近图片记忆：{'开启' if self._recent_memory_enabled() else '关闭'}\n"
+            f"追问复用：{'仅疑似图片追问' if followup_only else 'TTL 内所有 LLM 请求'}\n"
+            f"记忆有效期：{self._recent_image_ttl()} 秒\n"
+            f"本会话缓存：{len(recent)} 张"
+            + (f"（约 {age:.0f} 秒前）" if recent else "")
         )
+
+    @filter.command("force_caption_forget")
+    async def force_caption_forget(self, event: AstrMessageEvent):
+        removed = await self._forget_recent_images(event)
+        yield event.plain_result(
+            "已清除本会话最近图片记忆。" if removed else "本会话当前没有最近图片记忆。"
+        )
+
+    async def terminate(self):
+        async with self._recent_images_lock:
+            self._recent_images.clear()

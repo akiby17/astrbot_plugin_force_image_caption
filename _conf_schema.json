@@ -3,7 +3,7 @@
     "description": "启用插件",
     "type": "bool",
     "default": true,
-    "hint": "开启后，在已触发 LLM 的消息中自动处理图片。"
+    "hint": "开启后，在已触发 LLM 的消息中自动处理图片，并可记住最近图片供下一轮追问。"
   },
   "caption_provider_id": {
     "description": "图片转述模型 Provider ID（可留空）",
@@ -15,7 +15,37 @@
     "description": "图片理解提示词",
     "type": "text",
     "default": "把自己当成刚刚看了一眼朋友发来的图片，理解它想表达什么。不要逐项描述画面，不要使用‘图片中’‘画面里’‘可以看到’‘这是一张’等解说式表达。优先提取后续聊天真正需要的信息：情绪、动作、梗、态度、关键文字或截图中的重点。表情包重点理解情绪和意思；截图重点提取与当前聊天有关的信息。只输出1～2句简短自然的理解结果，不要直接回复用户。",
-    "hint": "这段内容只用于视觉模型理解图片，不需要用户说“识图”“描述图片”等关键词。"
+    "hint": "视觉模型会自动附加当前用户问题作为语境，例如“第二个是谁”，因此更容易提取真正需要的视觉信息。"
+  },
+  "remember_recent_images": {
+    "description": "记住本会话最近图片",
+    "type": "bool",
+    "default": true,
+    "hint": "开启后，即使用户先单独发图、下一条才提问，插件也能复用最近图片继续识别。仅缓存图片引用，不复制图片二进制。"
+  },
+  "recent_image_ttl_seconds": {
+    "description": "最近图片记忆有效期（秒）",
+    "type": "int",
+    "default": 300,
+    "hint": "默认5分钟。超过此时间后不会再把旧图用于新的追问，最大限制为3600秒。"
+  },
+  "recent_image_followup_only": {
+    "description": "仅在疑似图片追问时复用最近图片",
+    "type": "bool",
+    "default": true,
+    "hint": "建议开启。会识别“第二个是谁”“左边是谁”“这张呢”“什么意思”等追问，避免把旧图误带入无关聊天。关闭后，TTL内所有LLM请求都可复用最近图片。"
+  },
+  "recent_image_max_count": {
+    "description": "每个会话最多记住的最近图片数",
+    "type": "int",
+    "default": 4,
+    "hint": "同一条消息有多张图时最多缓存多少张，建议1～4。"
+  },
+  "followup_context_max_chars": {
+    "description": "传给视觉模型的当前问题最大字符数",
+    "type": "int",
+    "default": 300,
+    "hint": "用于让视觉模型理解当前追问语境，避免把过长文本全部传入识图请求。设为0表示不截断。"
   },
   "max_retries": {
     "description": "识图失败最大重试次数",
@@ -81,6 +111,6 @@
     "description": "调试日志",
     "type": "bool",
     "default": false,
-    "hint": "开启后会记录每次重试、等待时间和多图逐张恢复情况。"
+    "hint": "开启后会记录当前图/最近图来源、缓存命中、重试等待时间和多图逐张恢复情况。"
   }
 }
