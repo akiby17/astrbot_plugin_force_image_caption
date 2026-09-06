@@ -47,6 +47,24 @@
     "default": true,
     "hint": "建议开启。会识别“第二个是谁”“左边是谁”“这张呢”“什么意思”等追问，避免把旧图误带入无关聊天。关闭后，TTL内所有LLM请求都可复用最近图片。"
   },
+  "natural_followup_enabled": {
+    "description": "图片后的短时自然续聊也复用最近图片",
+    "type": "bool",
+    "default": true,
+    "hint": "建议开启。用户发图后短时间内继续说“这个超级好吃”“好想买”“笑死”等自然续聊，即使没有明确问“图里是什么”，也会沿用刚才的图片语境。"
+  },
+  "natural_followup_window_seconds": {
+    "description": "自然续聊图片语境窗口（秒）",
+    "type": "int",
+    "default": 90,
+    "hint": "默认90秒。仅用于自然续聊；“第二个是谁”“这张呢”等明确图片追问仍使用上面的最近图片记忆有效期。建议群聊设60～120秒。"
+  },
+  "natural_followup_same_sender_only": {
+    "description": "自然续聊仅限发图本人",
+    "type": "bool",
+    "default": true,
+    "hint": "群聊强烈建议开启，避免别人突然发一句普通话时误用上一位群友的图片。明确的“图里/这张/第二个”等图片追问不受此限制。"
+  },
   "recent_image_max_count": {
     "description": "每个会话最多记住的最近图片数",
     "type": "int",

@@ -116,6 +116,18 @@ class ForceImageCaption(Star):
         except (TypeError, ValueError):
             return 4
 
+    def _natural_followup_enabled(self) -> bool:
+        return bool(self.config.get("natural_followup_enabled", True))
+
+    def _natural_followup_window(self) -> int:
+        try:
+            return max(5, min(int(self.config.get("natural_followup_window_seconds", 90)), 600))
+        except (TypeError, ValueError):
+            return 90
+
+    def _natural_followup_same_sender_only(self) -> bool:
+        return bool(self.config.get("natural_followup_same_sender_only", True))
+
     def _persist_recent_images_enabled(self) -> bool:
         return bool(self.config.get("persist_recent_images", True))
 
@@ -549,6 +561,22 @@ class ForceImageCaption(Star):
         return str(value or "")
 
     @staticmethod
+    def _sender_id(event: AstrMessageEvent) -> str:
+        try:
+            value = event.get_sender_id()
+            if value is not None and str(value).strip():
+                return str(value).strip()
+        except Exception:
+            pass
+        obj = getattr(event, "message_obj", None)
+        sender = getattr(obj, "sender", None) if obj is not None else None
+        for attr in ("user_id", "id", "sender_id"):
+            value = getattr(sender, attr, None) if sender is not None else None
+            if value is not None and str(value).strip():
+                return str(value).strip()
+        return ""
+
+    @staticmethod
     def _cacheable_image_ref(ref: str) -> bool:
         if not isinstance(ref, str) or not ref.strip():
             return False
@@ -582,6 +610,17 @@ class ForceImageCaption(Star):
         value = re.sub(r"\s+", "", text).lower()
         if not value:
             return False
+
+        # Natural image references are often statements rather than questions,
+        # e.g. “这个超级好吃”“这个也太可爱了”“那玩意我也想买”.
+        # Keeping this short avoids turning every long message containing “这个”
+        # into an image follow-up.
+        natural_reference = re.match(
+            r"^(?:这个|那个|这张|那张|这玩意|那玩意|这东西|那东西|它|他|她|ta)(?:也|真|太|还|好|超|挺|有点|简直|居然|看着|感觉|怎么|为什么|是|不)?",
+            value,
+        )
+        if natural_reference and len(value) <= 36:
+            return True
 
         explicit = (
             "图片", "照片", "截图", "表情包", "表情", "图里", "图中", "画面",
@@ -627,6 +666,7 @@ class ForceImageCaption(Star):
                 "ts": now,
                 "images": cacheable,
                 "message_id": self._message_id(event),
+                "sender_id": self._sender_id(event),
             }
             # Opportunistic cleanup prevents long-running bots from accumulating
             # one cache entry for every group/private chat ever seen.
@@ -646,9 +686,9 @@ class ForceImageCaption(Star):
                 len(cacheable),
             )
 
-    async def _get_recent_images(self, event: AstrMessageEvent) -> tuple[list[str], float]:
+    async def _get_recent_images(self, event: AstrMessageEvent) -> tuple[list[str], float, str]:
         if not self._recent_memory_enabled():
-            return [], 0.0
+            return [], 0.0, ""
 
         key = self._session_key(event)
         now = time.time()
@@ -656,13 +696,14 @@ class ForceImageCaption(Star):
         async with self._recent_images_lock:
             item = self._recent_images.get(key)
             if not item:
-                return [], 0.0
+                return [], 0.0, ""
             age = max(0.0, now - float(item.get("ts", 0.0) or 0.0))
             if age > ttl:
                 self._recent_images.pop(key, None)
-                return [], age
+                return [], age, ""
             images = list(item.get("images", []) or [])
-        return self._dedupe(images), age
+            sender_id = str(item.get("sender_id", "") or "")
+        return self._dedupe(images), age, sender_id
 
     async def _forget_recent_images(self, event: AstrMessageEvent) -> bool:
         key = self._session_key(event)
@@ -1043,17 +1084,41 @@ class ForceImageCaption(Star):
         if not images and self._recent_memory_enabled():
             user_text = self._current_user_text(event)
             followup_only = bool(self.config.get("recent_image_followup_only", True))
-            should_reuse = (not followup_only) or self._looks_like_image_followup(user_text)
-            if should_reuse:
-                recent_images, age = await self._get_recent_images(event)
-                if recent_images:
+            recent_images, age, image_sender_id = await self._get_recent_images(event)
+            if recent_images:
+                explicit_followup = self._looks_like_image_followup(user_text)
+                natural_followup = False
+                if self._natural_followup_enabled() and age <= self._natural_followup_window():
+                    current_sender_id = self._sender_id(event)
+                    same_sender = bool(
+                        current_sender_id
+                        and image_sender_id
+                        and current_sender_id == image_sender_id
+                    )
+                    natural_followup = (
+                        not self._natural_followup_same_sender_only()
+                        or same_sender
+                    )
+
+                should_reuse = (
+                    (not followup_only)
+                    or explicit_followup
+                    or natural_followup
+                )
+                if should_reuse:
                     images = recent_images
                     image_source = "recent"
                     if self.config.get("debug_log", False):
+                        reason = (
+                            "explicit" if explicit_followup
+                            else "natural-window" if natural_followup
+                            else "always"
+                        )
                         logger.info(
-                            "[ForceImageCaption] reused recent image(s) for follow-up count=%d age=%.1fs text=%r",
+                            "[ForceImageCaption] reused recent image(s) for follow-up count=%d age=%.1fs reason=%s text=%r",
                             len(images),
                             age,
+                            reason,
                             user_text[:80],
                         )
 
@@ -1137,7 +1202,7 @@ class ForceImageCaption(Star):
     @filter.command("force_caption_status")
     async def force_caption_status(self, event: AstrMessageEvent):
         provider_id = self._caption_provider_id(event) or "（未配置）"
-        recent, age = await self._get_recent_images(event)
+        recent, age, _image_sender_id = await self._get_recent_images(event)
         followup_only = bool(self.config.get("recent_image_followup_only", True))
         yield event.plain_result(
             "Force Image Caption\n"
@@ -1147,8 +1212,10 @@ class ForceImageCaption(Star):
             f"静默失败：{'开启' if self.config.get('silent_failure', True) else '关闭'}\n"
             f"最近图片记忆：{'开启' if self._recent_memory_enabled() else '关闭'}\n"
             f"临时图持久化：{'开启' if self._persist_recent_images_enabled() else '关闭'}\n"
-            f"追问复用：{'仅疑似图片追问' if followup_only else 'TTL 内所有 LLM 请求'}\n"
-            f"记忆有效期：{self._recent_image_ttl()} 秒\n"
+            f"追问复用：{'图片追问 + 短时自然续聊' if followup_only else 'TTL 内所有 LLM 请求'}\n"
+            f"自然续聊窗口：{'开启' if self._natural_followup_enabled() else '关闭'}"
+            + (f"（{self._natural_followup_window()} 秒，{'仅同一发送者' if self._natural_followup_same_sender_only() else '群内任意发送者'}）\n" if self._natural_followup_enabled() else "\n")
+            + f"记忆有效期：{self._recent_image_ttl()} 秒\n"
             f"本会话缓存：{len(recent)} 张"
             + (f"（约 {age:.0f} 秒前）" if recent else "")
         )
