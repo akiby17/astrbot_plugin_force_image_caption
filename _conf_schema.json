@@ -65,6 +65,30 @@
     "default": true,
     "hint": "群聊强烈建议开启，避免别人突然发一句普通话时误用上一位群友的图片。明确的“图里/这张/第二个”等图片追问不受此限制。"
   },
+  "reuse_caption_for_natural_followup": {
+    "description": "自然续聊优先复用上次图片转述",
+    "type": "bool",
+    "default": true,
+    "hint": "强烈建议开启。发图后说“哈哈”“确实”“这个好可爱”等自然续聊时，直接复用上一轮成功转述，不再重复调用视觉模型；“第二个是谁/图里写了什么”等细节追问仍会重新识图。"
+  },
+  "caption_cache_ttl_seconds": {
+    "description": "图片转述缓存有效期（秒）",
+    "type": "int",
+    "default": 300,
+    "hint": "用于重复事件、相同图片相同问题和并发请求去重。默认5分钟，最大3600秒。只缓存转述文本，不缓存额外图片二进制。"
+  },
+  "serialize_caption_requests": {
+    "description": "视觉请求串行保护",
+    "type": "bool",
+    "default": true,
+    "hint": "建议开启。不同消息同时触发识图时排队发送，减少短时间请求突发导致RPM超限；不会删除识图任务，只会让并发请求依次执行。"
+  },
+  "rate_limit_cooldown_seconds": {
+    "description": "429/计费拒绝后的视觉调用冷却时间（秒）",
+    "type": "int",
+    "default": 60,
+    "hint": "检测到RPM/TPM限流、配额耗尽、账号计费暂停或鉴权错误后，暂时停止新的视觉请求，避免连续撞限额。期间优先复用已有转述。"
+  },
   "recent_image_max_count": {
     "description": "每个会话最多记住的最近图片数",
     "type": "int",
@@ -77,11 +101,17 @@
     "default": 300,
     "hint": "用于让视觉模型理解当前追问语境，避免把过长文本全部传入识图请求。设为0表示不截断。"
   },
+  "enable_plugin_retries": {
+    "description": "启用插件额外重试（AstrBot 4.28+ 不建议）",
+    "type": "bool",
+    "default": false,
+    "hint": "默认关闭。即使旧版配置里 max_retries 仍是2，v1.2.4升级后也不会继续双层重试；只有确认当前Provider没有底层重试时再开启。"
+  },
   "max_retries": {
     "description": "识图失败最大重试次数",
     "type": "int",
-    "default": 2,
-    "hint": "不含首次请求。例如设为2，最多会尝试3次。仅对超时、连接错误、5xx和空响应等临时失败重试；422/429等通常不会重复请求。"
+    "default": 0,
+    "hint": "不含首次请求。AstrBot 4.28+ Provider 已自带重试，默认设为0避免“双层重试”放大RPM；只有确认底层Provider不重试时再手动设为1～2。"
   },
   "retry_delay_seconds": {
     "description": "首次重试等待时间（秒）",
@@ -111,7 +141,7 @@
     "description": "多图失败后逐张重试",
     "type": "bool",
     "default": true,
-    "hint": "多张图片一起识别失败时，再逐张识别；每张图也会应用上面的重试次数。"
+    "hint": "保留多图逐张恢复，但v1.2.4只在批量/格式/图片数量等可恢复错误时拆分；429、RPM/TPM、计费暂停、超时和服务端故障不会继续拆图追加请求。"
   },
   "remove_images_from_main_model": {
     "description": "转述成功后移除原图",

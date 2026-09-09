@@ -38,6 +38,20 @@ class ForceImageCaption(Star):
         self._persist_lock = asyncio.Lock()
         self._last_persist_cleanup_ts = 0.0
 
+        # v1.2.4: keep the image-chat experience while avoiding duplicate vision calls.
+        # Cache entries contain caption text only; no image bytes are retained here.
+        self._caption_cache: dict[str, dict[str, Any]] = {}
+        self._caption_cache_lock = asyncio.Lock()
+        self._caption_inflight: dict[str, asyncio.Task[str]] = {}
+        self._caption_inflight_lock = asyncio.Lock()
+        self._caption_request_lock = asyncio.Lock()
+
+        # provider_id -> unix timestamp until which new vision calls are suppressed.
+        # This circuit breaker is primarily for RPM/TPM exhaustion and billing/auth
+        # failures, so repeated chat messages do not keep hammering a blocked API.
+        self._provider_cooldown_until: dict[str, float] = {}
+        self._provider_cooldown_lock = asyncio.Lock()
+
     def _provider_settings(self, event: AstrMessageEvent) -> dict[str, Any]:
         try:
             cfg = self.context.get_config(umo=event.unified_msg_origin)
@@ -77,11 +91,19 @@ class ForceImageCaption(Star):
             "只输出1～2句简短自然的理解结果，不要直接回复用户。"
         )
 
+    def _plugin_retries_enabled(self) -> bool:
+        # New guard in v1.2.4. Existing v1.2.2 installations may already have
+        # max_retries=2 persisted in their config; this opt-in switch ensures an
+        # upgrade does not silently keep double-retrying on AstrBot 4.28+.
+        return bool(self.config.get("enable_plugin_retries", False))
+
     def _max_retries(self) -> int:
+        if not self._plugin_retries_enabled():
+            return 0
         try:
-            return max(0, min(int(self.config.get("max_retries", 2)), 10))
+            return max(0, min(int(self.config.get("max_retries", 0)), 10))
         except (TypeError, ValueError):
-            return 2
+            return 0
 
     def _retry_delay(self) -> float:
         try:
@@ -94,6 +116,24 @@ class ForceImageCaption(Star):
             return max(1.0, min(float(self.config.get("retry_backoff", 1.8)), 5.0))
         except (TypeError, ValueError):
             return 1.8
+
+    def _caption_cache_ttl(self) -> int:
+        try:
+            return max(10, min(int(self.config.get("caption_cache_ttl_seconds", 300)), 3600))
+        except (TypeError, ValueError):
+            return 300
+
+    def _rate_limit_cooldown(self) -> int:
+        try:
+            return max(5, min(int(self.config.get("rate_limit_cooldown_seconds", 60)), 1800))
+        except (TypeError, ValueError):
+            return 60
+
+    def _reuse_caption_for_natural_followup(self) -> bool:
+        return bool(self.config.get("reuse_caption_for_natural_followup", True))
+
+    def _serialize_caption_requests(self) -> bool:
+        return bool(self.config.get("serialize_caption_requests", True))
 
     def _caption_timeout(self) -> int:
         try:
@@ -648,6 +688,39 @@ class ForceImageCaption(Star):
         }
         return len(value) <= 18 and value in short_followups
 
+    @staticmethod
+    def _needs_fresh_visual_followup(text: str) -> bool:
+        """Whether a follow-up really needs another look at the original image.
+
+        Natural reactions such as “笑死 / 这个好可爱 / 确实” can safely reuse the
+        previous caption. Requests for OCR, position, identity, counting, comparison,
+        or fine visual details should re-query the vision model.
+        """
+        if not isinstance(text, str):
+            return False
+        value = re.sub(r"\s+", "", text).lower()
+        if not value:
+            return False
+
+        detail_tokens = (
+            "写了什么", "写的什么", "写了啥", "写的啥", "什么字", "文字", "字幕",
+            "第一个", "第二个", "第三个", "第四个", "第五个", "第几",
+            "左边", "右边", "中间", "上面", "下面", "前面", "后面", "角落",
+            "是谁", "谁啊", "谁呀", "哪一个", "哪个", "哪位", "叫什么", "名字",
+            "拿着", "穿着", "戴着", "颜色", "几个人", "几个", "多少", "数量",
+            "区别", "不同", "对比", "比较", "哪张", "哪边", "哪里", "位置",
+            "细节", "放大", "看清", "认一下", "识别", "ocr",
+        )
+        if any(token in value for token in detail_tokens):
+            return True
+
+        # Ordinal + question is almost always a request for a more specific look.
+        if re.search(r"第(?:[一二三四五六七八九十百两\d]+)(?:个|位|只|张|排|行|列)?", value):
+            if any(token in value for token in ("谁", "什么", "啥", "哪", "怎么", "干嘛", "在做")):
+                return True
+
+        return False
+
     async def _remember_images(self, event: AstrMessageEvent, images: list[str]) -> None:
         if not self._recent_memory_enabled():
             return
@@ -662,14 +735,19 @@ class ForceImageCaption(Star):
         key = self._session_key(event)
         now = time.time()
         async with self._recent_images_lock:
+            previous = self._recent_images.get(key) or {}
+            same_images = self._dedupe(list(previous.get("images", []) or [])) == cacheable
             self._recent_images[key] = {
                 "ts": now,
                 "images": cacheable,
                 "message_id": self._message_id(event),
                 "sender_id": self._sender_id(event),
+                # Preserve a successful caption when the same image is observed again
+                # by another AstrBot stage. This prevents duplicate vision calls.
+                "caption": str(previous.get("caption", "") or "") if same_images else "",
+                "caption_ts": float(previous.get("caption_ts", 0.0) or 0.0) if same_images else 0.0,
+                "caption_provider_id": str(previous.get("caption_provider_id", "") or "") if same_images else "",
             }
-            # Opportunistic cleanup prevents long-running bots from accumulating
-            # one cache entry for every group/private chat ever seen.
             ttl = self._recent_image_ttl()
             if len(self._recent_images) > 256:
                 expired = [
@@ -681,14 +759,17 @@ class ForceImageCaption(Star):
 
         if self.config.get("debug_log", False):
             logger.info(
-                "[ForceImageCaption] remembered recent image(s) session=%s count=%d",
+                "[ForceImageCaption] remembered recent image(s) session=%s count=%d preserved_caption=%s",
                 key,
                 len(cacheable),
+                bool(same_images and previous.get("caption")),
             )
 
-    async def _get_recent_images(self, event: AstrMessageEvent) -> tuple[list[str], float, str]:
+    async def _get_recent_context(
+        self, event: AstrMessageEvent
+    ) -> tuple[list[str], float, str, str]:
         if not self._recent_memory_enabled():
-            return [], 0.0, ""
+            return [], 0.0, "", ""
 
         key = self._session_key(event)
         now = time.time()
@@ -696,14 +777,43 @@ class ForceImageCaption(Star):
         async with self._recent_images_lock:
             item = self._recent_images.get(key)
             if not item:
-                return [], 0.0, ""
+                return [], 0.0, "", ""
             age = max(0.0, now - float(item.get("ts", 0.0) or 0.0))
             if age > ttl:
                 self._recent_images.pop(key, None)
-                return [], age, ""
+                return [], age, "", ""
             images = list(item.get("images", []) or [])
             sender_id = str(item.get("sender_id", "") or "")
-        return self._dedupe(images), age, sender_id
+            caption = str(item.get("caption", "") or "").strip()
+        return self._dedupe(images), age, sender_id, caption
+
+    async def _get_recent_images(self, event: AstrMessageEvent) -> tuple[list[str], float, str]:
+        images, age, sender_id, _caption = await self._get_recent_context(event)
+        return images, age, sender_id
+
+    async def _store_recent_caption(
+        self,
+        event: AstrMessageEvent,
+        images: list[str],
+        caption: str,
+        provider_id: str = "",
+    ) -> None:
+        caption = str(caption or "").strip()
+        if not caption or not self._recent_memory_enabled():
+            return
+
+        key = self._session_key(event)
+        normalized = [v for v in self._dedupe(images) if self._cacheable_image_ref(v)]
+        async with self._recent_images_lock:
+            item = self._recent_images.get(key)
+            if not item:
+                return
+            remembered = self._dedupe(list(item.get("images", []) or []))
+            if normalized and remembered != normalized[: self._recent_image_max_count()]:
+                return
+            item["caption"] = caption
+            item["caption_ts"] = time.time()
+            item["caption_provider_id"] = str(provider_id or "")
 
     async def _forget_recent_images(self, event: AstrMessageEvent) -> bool:
         key = self._session_key(event)
@@ -860,39 +970,183 @@ class ForceImageCaption(Star):
         return self._dedupe(event_images + normalized_req)
 
     @staticmethod
-    def _is_retryable(exc: Exception) -> bool:
-        text = str(exc).lower()
+    def _error_text(exc: Exception) -> str:
+        return str(exc).lower()
+
+    @classmethod
+    def _is_hard_stop_error(cls, exc: Exception) -> bool:
+        """Errors where immediately sending more requests is counterproductive."""
+        text = cls._error_text(exc)
+        hard_stop = (
+            "429", "rpm exhausted", "tpm", "rate_limit", "rate limit",
+            "quota_exceeded", "quota exceeded", "429001",
+            "account_billing_suspended", "billing status", "billing suspended",
+            "account is suspended", "401", "invalid api key", "authentication",
+        )
+        return any(token in text for token in hard_stop)
+
+    @classmethod
+    def _is_retryable(cls, exc: Exception) -> bool:
+        text = cls._error_text(exc)
+
+        if cls._is_hard_stop_error(exc):
+            return False
 
         # These usually cannot be fixed by sending the exact same request again.
         non_retryable = (
-            "400",
-            "401",
-            "403",
-            "404",
-            "413",
-            "422",
-            "429",
-            "invalid_request",
-            "rate_limit",
-            "sensitive",
-            "content policy",
+            "400", "403", "404", "413", "422",
+            "invalid_request", "sensitive", "content policy",
         )
         if any(token in text for token in non_retryable):
             return False
 
         retryable = (
-            "timeout",
-            "timed out",
-            "connection",
-            "temporarily",
-            "reset by peer",
-            "eof",
-            "500",
-            "502",
-            "503",
-            "504",
+            "timeout", "timed out", "connection", "temporarily",
+            "reset by peer", "eof", "500", "502", "503", "504",
         )
         return any(token in text for token in retryable)
+
+    @classmethod
+    def _should_split_multi_image_error(cls, exc: Exception) -> bool:
+        """Split only when per-image retry could plausibly fix a batch/format issue."""
+        text = cls._error_text(exc)
+        if cls._is_hard_stop_error(exc) or cls._is_retryable(exc):
+            return False
+
+        # Payload/image-count/client-format failures can often be recovered by
+        # sending images one by one. Do not do this for RPM/TPM/server outages.
+        split_hints = (
+            "multiple image", "multiple images", "multi-image", "multi image",
+            "too many image", "too many images", "image count", "image_num",
+            "unsupported image", "unsupported images", "payload",
+            "400", "413", "422", "invalid_request", "invalid request",
+        )
+        return any(token in text for token in split_hints)
+
+    @staticmethod
+    def _normalize_cache_text(text: str) -> str:
+        value = re.sub(r"\s+", " ", str(text or "")).strip().lower()
+        return value[:500]
+
+    def _image_signature(self, images: list[str]) -> str:
+        parts: list[str] = []
+        for ref in self._dedupe(images):
+            local = self._ref_to_local_path(ref)
+            if local is not None and local.exists():
+                try:
+                    stat = local.stat()
+                    parts.append(f"file:{local}:{stat.st_size}:{stat.st_mtime_ns}")
+                    continue
+                except OSError:
+                    pass
+            parts.append(str(ref))
+        raw = "\n".join(parts).encode("utf-8", errors="ignore")
+        return hashlib.sha1(raw).hexdigest()
+
+    def _caption_cache_key(
+        self, provider_id: str, images: list[str], *, user_text: str = "", kind: str = "query"
+    ) -> str:
+        image_sig = self._image_signature(images)
+        text_sig = hashlib.sha1(
+            self._normalize_cache_text(user_text).encode("utf-8", errors="ignore")
+        ).hexdigest()[:16]
+        return f"{provider_id}|{image_sig}|{kind}|{text_sig}"
+
+    async def _get_caption_cache(self, key: str) -> str:
+        now = time.time()
+        ttl = self._caption_cache_ttl()
+        async with self._caption_cache_lock:
+            item = self._caption_cache.get(key)
+            if not item:
+                return ""
+            if now - float(item.get("ts", 0.0) or 0.0) > ttl:
+                self._caption_cache.pop(key, None)
+                return ""
+            return str(item.get("caption", "") or "").strip()
+
+    async def _put_caption_cache(self, key: str, caption: str) -> None:
+        caption = str(caption or "").strip()
+        if not caption:
+            return
+        now = time.time()
+        async with self._caption_cache_lock:
+            self._caption_cache[key] = {"ts": now, "caption": caption}
+            if len(self._caption_cache) > 512:
+                oldest = sorted(
+                    self._caption_cache.items(),
+                    key=lambda kv: float(kv[1].get("ts", 0.0) or 0.0),
+                )[:128]
+                for cache_key, _item in oldest:
+                    self._caption_cache.pop(cache_key, None)
+
+    async def _provider_cooldown_remaining(self, provider_id: str) -> float:
+        now = time.time()
+        async with self._provider_cooldown_lock:
+            until = float(self._provider_cooldown_until.get(provider_id, 0.0) or 0.0)
+            if until <= now:
+                self._provider_cooldown_until.pop(provider_id, None)
+                return 0.0
+            return until - now
+
+    async def _trip_provider_cooldown(self, provider_id: str, exc: Exception) -> None:
+        if not self._is_hard_stop_error(exc):
+            return
+        seconds = self._rate_limit_cooldown()
+        until = time.time() + seconds
+        async with self._provider_cooldown_lock:
+            self._provider_cooldown_until[provider_id] = max(
+                float(self._provider_cooldown_until.get(provider_id, 0.0) or 0.0),
+                until,
+            )
+        logger.warning(
+            "[ForceImageCaption] provider进入冷却 %ss，避免继续触发RPM/TPM或计费拒绝 provider=%s error=%s",
+            seconds,
+            provider_id,
+            exc,
+        )
+
+    async def _generate_caption_dedup(
+        self,
+        event: AstrMessageEvent,
+        provider_id: str,
+        images: list[str],
+        *,
+        image_source: str,
+        cache_key: str,
+    ) -> str:
+        cached = await self._get_caption_cache(cache_key)
+        if cached:
+            if self.config.get("debug_log", False):
+                logger.info("[ForceImageCaption] caption cache hit key=%s", cache_key[-40:])
+            return cached
+
+        async with self._caption_inflight_lock:
+            task = self._caption_inflight.get(cache_key)
+            if task is None:
+                task = asyncio.create_task(
+                    self._generate_caption(
+                        event,
+                        provider_id,
+                        images,
+                        image_source=image_source,
+                    )
+                )
+                self._caption_inflight[cache_key] = task
+                created = True
+            else:
+                created = False
+
+        try:
+            caption = await asyncio.shield(task)
+        finally:
+            if created:
+                async with self._caption_inflight_lock:
+                    if self._caption_inflight.get(cache_key) is task:
+                        self._caption_inflight.pop(cache_key, None)
+
+        if caption:
+            await self._put_caption_cache(cache_key, caption)
+        return caption
 
     async def _caption_once(
         self,
@@ -900,13 +1154,20 @@ class ForceImageCaption(Star):
         prompt: str,
         images: list[str],
     ) -> str:
-        response = await asyncio.wait_for(
-            provider.text_chat(
-                prompt=prompt,
-                image_urls=images,
-            ),
-            timeout=self._caption_timeout(),
-        )
+        async def _do_request():
+            return await asyncio.wait_for(
+                provider.text_chat(
+                    prompt=prompt,
+                    image_urls=images,
+                ),
+                timeout=self._caption_timeout(),
+            )
+
+        if self._serialize_caption_requests():
+            async with self._caption_request_lock:
+                response = await _do_request()
+        else:
+            response = await _do_request()
         return str(getattr(response, "completion_text", "") or "").strip()
 
     async def _caption_with_retries(
@@ -993,8 +1254,17 @@ class ForceImageCaption(Star):
         except Exception as exc:
             batch_exc = exc
 
-        # If multiple images fail as one request, rescue them one by one.
-        if len(images) > 1 and self.config.get("split_multi_image_on_failure", True):
+        # If multiple images fail as one request, rescue them one by one only
+        # when the failure looks like a batch/payload/image-count problem. A 429,
+        # billing suspension, timeout or server outage must never fan out into N
+        # additional requests.
+        should_split = bool(
+            len(images) > 1
+            and self.config.get("split_multi_image_on_failure", True)
+            and batch_exc is not None
+            and self._should_split_multi_image_error(batch_exc)
+        )
+        if should_split:
             captions: list[str] = []
             for index, image in enumerate(images, 1):
                 try:
@@ -1005,6 +1275,10 @@ class ForceImageCaption(Star):
                         label=f"image-{index}",
                     )
                 except Exception as exc:
+                    # A hard-stop error during split recovery aborts the whole rescue
+                    # immediately, rather than continuing with the remaining images.
+                    if self._is_hard_stop_error(exc):
+                        raise
                     if self.config.get("debug_log", False):
                         logger.warning(
                             "[ForceImageCaption] image-%d failed after retries: %s",
@@ -1017,6 +1291,16 @@ class ForceImageCaption(Star):
 
             if captions:
                 return "\n".join(captions)
+        elif (
+            len(images) > 1
+            and self.config.get("split_multi_image_on_failure", True)
+            and batch_exc is not None
+            and self.config.get("debug_log", False)
+        ):
+            logger.info(
+                "[ForceImageCaption] skipped multi-image split because error is not safely recoverable: %s",
+                batch_exc,
+            )
 
         if batch_exc is not None:
             raise batch_exc
@@ -1045,26 +1329,19 @@ class ForceImageCaption(Star):
         if not self.config.get("enabled", True):
             return
 
-        # AstrBot's built-in caption path may have failed before this late hook.
-        # Never expose its visible failure marker to the final text model.
         if self.config.get("silent_failure", True):
             self._strip_failure_markers(req)
 
-        # Persist framework temp images before resolving refs. AstrBot may clean
-        # data/temp before a downstream LLM tool (for example stealer's steal_meme)
-        # actually runs; rewriting the current Image component here keeps that tool
-        # from receiving a dead path.
         await self._persist_event_images(event)
 
-        # Resolve and remember the current image before any early return. This is
-        # important when AstrBot has already generated a caption for the current turn:
-        # later turns can still refer back to the same image.
         current_images = await self._resolve_images(event, req)
         if current_images:
             await self._remember_images(event, current_images)
 
         existing = self._existing_caption(req)
         if existing:
+            if current_images:
+                await self._store_recent_caption(event, current_images, existing)
             self._inject_caption_into_prompt(req, existing)
             self._remove_caption_parts(req)
 
@@ -1078,16 +1355,20 @@ class ForceImageCaption(Star):
                 )
             return
 
+        user_text = self._current_user_text(event)
         images = current_images
         image_source = "current"
+        recent_caption = ""
+        explicit_followup = False
+        natural_followup = False
+        fresh_visual_followup = False
 
         if not images and self._recent_memory_enabled():
-            user_text = self._current_user_text(event)
             followup_only = bool(self.config.get("recent_image_followup_only", True))
-            recent_images, age, image_sender_id = await self._get_recent_images(event)
+            recent_images, age, image_sender_id, recent_caption = await self._get_recent_context(event)
             if recent_images:
                 explicit_followup = self._looks_like_image_followup(user_text)
-                natural_followup = False
+                fresh_visual_followup = self._needs_fresh_visual_followup(user_text)
                 if self._natural_followup_enabled() and age <= self._natural_followup_window():
                     current_sender_id = self._sender_id(event)
                     same_sender = bool(
@@ -1115,23 +1396,40 @@ class ForceImageCaption(Star):
                             else "always"
                         )
                         logger.info(
-                            "[ForceImageCaption] reused recent image(s) for follow-up count=%d age=%.1fs reason=%s text=%r",
+                            "[ForceImageCaption] reused recent image context count=%d age=%.1fs reason=%s fresh_visual=%s cached_caption=%s text=%r",
                             len(images),
                             age,
                             reason,
+                            fresh_visual_followup,
+                            bool(recent_caption),
                             user_text[:80],
                         )
 
         if not images:
-            user_text = self._current_user_text(event)
             if self._looks_like_image_followup(user_text):
-                # A likely visual follow-up reached us without a usable current/recent
-                # image (for example, cache expired or the adapter did not expose the
-                # original image). Keep the main model from narrating internal
-                # modality failures; it can ask a natural clarification instead.
                 self._inject_silent_fallback_hint(req)
             if self.config.get("debug_log", False):
                 logger.info("[ForceImageCaption] no usable image for this LLM request.")
+            return
+
+        # v1.2.4 key optimization: ordinary short-window continuation does not
+        # re-run the vision model. It reuses the most recent successful caption.
+        # Fine-grained visual questions still trigger a fresh vision request.
+        if (
+            image_source == "recent"
+            and recent_caption
+            and self._reuse_caption_for_natural_followup()
+            and not fresh_visual_followup
+        ):
+            self._inject_caption_into_prompt(req, recent_caption)
+            self._remove_caption_parts(req)
+            if self.config.get("remove_images_from_main_model", True):
+                req.image_urls = []
+            if self.config.get("debug_log", False):
+                logger.info(
+                    "[ForceImageCaption] reused cached recent caption without vision API call length=%d",
+                    len(recent_caption),
+                )
             return
 
         provider_id = self._caption_provider_id(event)
@@ -1148,25 +1446,67 @@ class ForceImageCaption(Star):
                 req.image_urls = []
             return
 
+        query_cache_key = self._caption_cache_key(
+            provider_id,
+            images,
+            user_text=user_text,
+            kind="query",
+        )
+        caption = await self._get_caption_cache(query_cache_key)
+        if caption:
+            await self._store_recent_caption(event, images, caption, provider_id)
+            self._inject_caption_into_prompt(req, caption)
+            self._remove_caption_parts(req)
+            if self.config.get("remove_images_from_main_model", True):
+                req.image_urls = []
+            if self.config.get("debug_log", False):
+                logger.info("[ForceImageCaption] exact caption cache hit; skipped vision API")
+            return
+
+        cooldown_remaining = await self._provider_cooldown_remaining(provider_id)
+        if cooldown_remaining > 0:
+            # If a general recent caption exists, use it as a safe fallback even for
+            # a detail question rather than repeatedly striking a known-limited API.
+            if recent_caption:
+                self._inject_caption_into_prompt(req, recent_caption)
+                self._remove_caption_parts(req)
+                if self.config.get("remove_images_from_main_model", True):
+                    req.image_urls = []
+                logger.info(
+                    "[ForceImageCaption] provider冷却中，复用已有图片理解，跳过视觉请求 remaining=%.1fs provider=%s",
+                    cooldown_remaining,
+                    provider_id,
+                )
+                return
+
+            logger.warning(
+                "[ForceImageCaption] provider冷却中，跳过新的视觉请求 remaining=%.1fs provider=%s",
+                cooldown_remaining,
+                provider_id,
+            )
+            self._inject_silent_fallback_hint(req)
+            if self.config.get("remove_images_on_failure", True):
+                req.image_urls = []
+            return
+
         try:
-            caption = await self._generate_caption(
+            caption = await self._generate_caption_dedup(
                 event,
                 provider_id,
                 images,
                 image_source=image_source,
+                cache_key=query_cache_key,
             )
         except Exception as exc:
+            await self._trip_provider_cooldown(provider_id, exc)
             logger.error(
-                "[ForceImageCaption] 图片转述失败，已结束重试 provider=%s images=%d retries=%d error=%s",
+                "[ForceImageCaption] 图片转述失败 provider=%s images=%d plugin_retries=%d error=%s",
                 provider_id,
                 len(images),
                 self._max_retries(),
                 exc,
             )
 
-            # Important: do not leave AstrBot's "[Image Captioning Failed]"
-            # in the final request, otherwise the main model tends to reply
-            # with "没看到图片/无法识别图片".
             if self.config.get("silent_failure", True):
                 self._strip_failure_markers(req)
             self._inject_silent_fallback_hint(req)
@@ -1183,6 +1523,8 @@ class ForceImageCaption(Star):
             if self.config.get("remove_images_on_failure", True):
                 req.image_urls = []
             return
+
+        await self._store_recent_caption(event, images, caption, provider_id)
 
         self._inject_caption_into_prompt(req, caption)
         self._remove_caption_parts(req)
@@ -1202,14 +1544,19 @@ class ForceImageCaption(Star):
     @filter.command("force_caption_status")
     async def force_caption_status(self, event: AstrMessageEvent):
         provider_id = self._caption_provider_id(event) or "（未配置）"
-        recent, age, _image_sender_id = await self._get_recent_images(event)
+        recent, age, _image_sender_id, recent_caption = await self._get_recent_context(event)
         followup_only = bool(self.config.get("recent_image_followup_only", True))
+        cooldown = await self._provider_cooldown_remaining(provider_id) if provider_id != "（未配置）" else 0.0
         yield event.plain_result(
-            "Force Image Caption\n"
+            "Force Image Caption v1.2.4\n"
             f"状态：{'启用' if self.config.get('enabled', True) else '关闭'}\n"
             f"图片转述模型：{provider_id}\n"
-            f"失败重试：{self._max_retries()} 次\n"
-            f"静默失败：{'开启' if self.config.get('silent_failure', True) else '关闭'}\n"
+            f"插件额外失败重试：{self._max_retries()} 次（AstrBot 4.28+ 建议 0）\n"
+            f"自然续聊复用转述：{'开启' if self._reuse_caption_for_natural_followup() else '关闭'}\n"
+            f"视觉请求串行保护：{'开启' if self._serialize_caption_requests() else '关闭'}\n"
+            f"限流冷却：{self._rate_limit_cooldown()} 秒"
+            + (f"（当前剩余约 {cooldown:.0f} 秒）\n" if cooldown > 0 else "\n")
+            + f"静默失败：{'开启' if self.config.get('silent_failure', True) else '关闭'}\n"
             f"最近图片记忆：{'开启' if self._recent_memory_enabled() else '关闭'}\n"
             f"临时图持久化：{'开启' if self._persist_recent_images_enabled() else '关闭'}\n"
             f"追问复用：{'图片追问 + 短时自然续聊' if followup_only else 'TTL 内所有 LLM 请求'}\n"
@@ -1217,7 +1564,7 @@ class ForceImageCaption(Star):
             + (f"（{self._natural_followup_window()} 秒，{'仅同一发送者' if self._natural_followup_same_sender_only() else '群内任意发送者'}）\n" if self._natural_followup_enabled() else "\n")
             + f"记忆有效期：{self._recent_image_ttl()} 秒\n"
             f"本会话缓存：{len(recent)} 张"
-            + (f"（约 {age:.0f} 秒前）" if recent else "")
+            + (f"（约 {age:.0f} 秒前，{'已有可复用转述' if recent_caption else '尚无转述'}）" if recent else "")
         )
 
     @filter.command("force_caption_forget")
@@ -1230,6 +1577,16 @@ class ForceImageCaption(Star):
     async def terminate(self):
         async with self._recent_images_lock:
             self._recent_images.clear()
+        async with self._caption_cache_lock:
+            self._caption_cache.clear()
+        async with self._provider_cooldown_lock:
+            self._provider_cooldown_until.clear()
+        async with self._caption_inflight_lock:
+            tasks = list(self._caption_inflight.values())
+            self._caption_inflight.clear()
+        for task in tasks:
+            if not task.done():
+                task.cancel()
         try:
             await self._cleanup_persistent_cache(force=True)
         except Exception:

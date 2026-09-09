@@ -1,10 +1,10 @@
 name: astrbot_plugin_force_image_caption
-display_name: Force Image Caption 强制图片转述
-short_desc: 为纯文本主模型补充图片理解，支持跨消息追问、自然续聊图片语境、临时图持久化、失败重试与静默降级。
+display_name: Force Image Caption
+short_desc: 为纯文本主模型补充图片理解，支持跨消息追问、自然续聊复用、防重复识图、RPM/TPM熔断与静默降级。
 desc: |
   自动调用视觉模型理解当前图片，再将结果交给纯文本主模型。
-  支持当前图片、引用图片、多图、最近图片跨消息追问、短时自然续聊图片语境、问题感知识图、临时图片持久化、失败重试与静默降级。
-version: 1.2.3
+  支持当前图片、引用图片、多图、最近图片跨消息追问、短时自然续聊图片语境、问题感知识图、临时图片持久化、转述缓存、并发去重、RPM/TPM熔断与静默降级。
+version: 1.2.4
 author: akiby17
 repo: https://github.com/akiby17/astrbot_plugin_force_image_caption
 astrbot_version: ">=4.23,<5"
