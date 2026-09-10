@@ -38,7 +38,7 @@ class ForceImageCaption(Star):
         self._persist_lock = asyncio.Lock()
         self._last_persist_cleanup_ts = 0.0
 
-        # v1.2.4: keep the image-chat experience while avoiding duplicate vision calls.
+        # v1.2.6: keep the image-chat experience while avoiding duplicate vision calls and group-chat catch-up replies.
         # Cache entries contain caption text only; no image bytes are retained here.
         self._caption_cache: dict[str, dict[str, Any]] = {}
         self._caption_cache_lock = asyncio.Lock()
@@ -167,6 +167,18 @@ class ForceImageCaption(Star):
 
     def _natural_followup_same_sender_only(self) -> bool:
         return bool(self.config.get("natural_followup_same_sender_only", True))
+
+    def _group_reply_scope_guard_enabled(self) -> bool:
+        """Keep image-triggered group replies focused on the current turn.
+
+        AstrBot may provide recent group messages as conversation context even when
+        those messages did not themselves trigger an LLM call.  When a later image
+        message does trigger the model, some models may try to "catch up" and
+        answer those older messages.  This guard keeps the history available for
+        context while marking it as background-only unless the current speaker
+        explicitly refers back to it.
+        """
+        return bool(self.config.get("group_reply_scope_guard", True))
 
     def _persist_recent_images_enabled(self) -> bool:
         return bool(self.config.get("persist_recent_images", True))
@@ -615,6 +627,89 @@ class ForceImageCaption(Star):
             if value is not None and str(value).strip():
                 return str(value).strip()
         return ""
+
+    @staticmethod
+    def _is_group_chat(event: AstrMessageEvent) -> bool:
+        try:
+            group_id = event.get_group_id()
+            if group_id is not None and str(group_id).strip():
+                return True
+        except Exception:
+            pass
+
+        # Adapter compatibility fallback.  aiocqhttp and several other adapters
+        # encode the message type in UMO/session identifiers.
+        candidates = [
+            getattr(event, "unified_msg_origin", ""),
+            getattr(getattr(event, "message_obj", None), "session_id", ""),
+        ]
+        return any(
+            isinstance(value, str) and "groupmessage" in value.lower()
+            for value in candidates
+        )
+
+    def _inject_group_reply_scope_hint(
+        self,
+        event: AstrMessageEvent,
+        req: ProviderRequest,
+        *,
+        image_source: str,
+    ) -> None:
+        """Prevent a group image turn from becoming a backlog/catch-up reply.
+
+        This does *not* delete chat history.  Older group messages remain available
+        to the model as background context.  We only add a temporary current-turn
+        instruction so the model does not interpret every historical line as an
+        unanswered request that now needs a response.
+        """
+        if not self._group_reply_scope_guard_enabled() or not self._is_group_chat(event):
+            return
+
+        source_text = "当前消息中的图片" if image_source == "current" else "当前追问所指向的最近图片"
+        hint = (
+            "<group_reply_scope_hint>"
+            "这是群聊中的当前轮回复。历史群消息仅用于理解语境，不代表现在需要补回复。"
+            "请只直接回应当前触发这次 LLM 请求的发言者和当前这条消息，"
+            f"并结合{source_text}。"
+            "不要因为上下文里存在此前未回复的群聊文本，就逐条补答、补回应或主动回到旧话题。"
+            "只有当当前发言明确引用、追问或要求回应此前内容时，才回应对应的历史内容。"
+            "如果当前消息只有图片，就只围绕本轮图片自然回应。"
+            "</group_reply_scope_hint>"
+        )
+
+        for part in getattr(req, "extra_user_content_parts", []) or []:
+            if "<group_reply_scope_hint>" in self._part_text(part):
+                return
+
+        try:
+            from astrbot.core.agent.message import TextPart
+
+            part = TextPart(text=hint)
+            mark_temp = getattr(part, "mark_as_temp", None)
+            if callable(mark_temp):
+                marked = mark_temp()
+                if marked is not None:
+                    part = marked
+            req.extra_user_content_parts.append(part)
+            if self.config.get("debug_log", False):
+                logger.info(
+                    "[ForceImageCaption] group reply scope guard injected source=%s",
+                    image_source,
+                )
+            return
+        except Exception as exc:
+            if self.config.get("debug_log", False):
+                logger.debug(
+                    "[ForceImageCaption] failed to add temporary group reply scope hint: %s",
+                    exc,
+                )
+
+        # Older AstrBot fallback. ProviderRequest.prompt is request-local here; the
+        # XML-like tag also makes duplicate insertion easy to detect.
+        prompt = getattr(req, "prompt", "")
+        prompt = prompt if isinstance(prompt, str) else ""
+        if "<group_reply_scope_hint>" not in prompt:
+            req.prompt = f"{prompt.rstrip()}\n\n{hint}".strip()
 
     @staticmethod
     def _cacheable_image_ref(ref: str) -> bool:
@@ -1341,6 +1436,9 @@ class ForceImageCaption(Star):
         existing = self._existing_caption(req)
         if existing:
             if current_images:
+                self._inject_group_reply_scope_hint(
+                    event, req, image_source="current"
+                )
                 await self._store_recent_caption(event, current_images, existing)
             self._inject_caption_into_prompt(req, existing)
             self._remove_caption_parts(req)
@@ -1405,6 +1503,11 @@ class ForceImageCaption(Star):
                             user_text[:80],
                         )
 
+        if images:
+            self._inject_group_reply_scope_hint(
+                event, req, image_source=image_source
+            )
+
         if not images:
             if self._looks_like_image_followup(user_text):
                 self._inject_silent_fallback_hint(req)
@@ -1412,7 +1515,7 @@ class ForceImageCaption(Star):
                 logger.info("[ForceImageCaption] no usable image for this LLM request.")
             return
 
-        # v1.2.4 key optimization: ordinary short-window continuation does not
+        # v1.2.5 keeps the v1.2.4 optimization: ordinary short-window continuation does not
         # re-run the vision model. It reuses the most recent successful caption.
         # Fine-grained visual questions still trigger a fresh vision request.
         if (
@@ -1548,11 +1651,12 @@ class ForceImageCaption(Star):
         followup_only = bool(self.config.get("recent_image_followup_only", True))
         cooldown = await self._provider_cooldown_remaining(provider_id) if provider_id != "（未配置）" else 0.0
         yield event.plain_result(
-            "Force Image Caption v1.2.4\n"
+            "Force Image Caption v1.2.6\n"
             f"状态：{'启用' if self.config.get('enabled', True) else '关闭'}\n"
             f"图片转述模型：{provider_id}\n"
             f"插件额外失败重试：{self._max_retries()} 次（AstrBot 4.28+ 建议 0）\n"
             f"自然续聊复用转述：{'开启' if self._reuse_caption_for_natural_followup() else '关闭'}\n"
+            f"群聊当前轮聚焦：{'开启' if self._group_reply_scope_guard_enabled() else '关闭'}\n"
             f"视觉请求串行保护：{'开启' if self._serialize_caption_requests() else '关闭'}\n"
             f"限流冷却：{self._rate_limit_cooldown()} 秒"
             + (f"（当前剩余约 {cooldown:.0f} 秒）\n" if cooldown > 0 else "\n")

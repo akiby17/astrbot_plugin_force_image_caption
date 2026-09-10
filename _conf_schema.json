@@ -65,6 +65,12 @@
     "default": true,
     "hint": "群聊强烈建议开启，避免别人突然发一句普通话时误用上一位群友的图片。明确的“图里/这张/第二个”等图片追问不受此限制。"
   },
+  "group_reply_scope_guard": {
+    "description": "群聊图片触发时只聚焦当前轮",
+    "type": "bool",
+    "default": true,
+    "hint": "强烈建议开启。群里前面的普通消息仍保留为上下文，但当当前图片/图片追问触发LLM时，明确要求主模型只回应当前发言者和本轮图片，不补回复此前未触发的旧消息；当前用户明确引用旧话题时仍可正常回应。"
+  },
   "reuse_caption_for_natural_followup": {
     "description": "自然续聊优先复用上次图片转述",
     "type": "bool",
