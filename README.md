@@ -1,4 +1,4 @@
-# Force Image Caption
+# Force Image Caption 强制图片转述
 
 **当前版本：v1.2.6**
 
