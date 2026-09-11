@@ -1,5 +1,5 @@
 name: astrbot_plugin_force_image_caption
-display_name: Force Image Caption
+display_name: Force Image Caption 强制图片转述
 short_desc: 为纯文本主模型补充图片理解，支持跨消息追问、群聊当前轮聚焦、防重复识图、RPM/TPM熔断与静默降级。
 desc: |
   自动调用视觉模型理解当前图片，再将结果交给纯文本主模型。
